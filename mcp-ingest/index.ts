@@ -116,6 +116,11 @@ async function constantTimeEqual(provided: string, expected: string): Promise<bo
   return difference === 0;
 }
 
+async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 const authHandler = {
   async fetch(request: Request, env: OAuthEnv): Promise<Response> {
     const url = new URL(request.url);
@@ -136,7 +141,12 @@ const authHandler = {
       const body = await request.formData();
       const authId = String(body.get("auth_id") ?? "");
       const password = String(body.get("password") ?? "");
+      const ipHash = await sha256Hex(request.headers.get("CF-Connecting-IP") ?? "unknown");
+      const attemptsKey = `agent:mcp:attempts:${ipHash}`;
+      const attempts = Number.parseInt(await env.CONFIG.get(attemptsKey) ?? "0", 10);
+      if (attempts >= 5) return html("<h1>Tạm khóa đăng nhập</h1><p>Đã thử quá nhiều lần. Hãy thử lại sau 10 phút.</p>", 429);
       if (!authId || authId !== cookieValue(request, "__Host-ALF_MCP_AUTH") || !await constantTimeEqual(password, env.CONNECT_PASSWORD)) {
+        await env.CONFIG.put(attemptsKey, String(attempts + 1), { expirationTtl: 600 });
         return html("<h1>Không thể cấp quyền</h1><p>Mật khẩu hoặc phiên xác thực không hợp lệ.</p>", 401);
       }
       const stored = await env.CONFIG.get(`agent:mcp:authorize:${authId}`, "json");
@@ -149,6 +159,7 @@ const authHandler = {
         scope: (stored as AuthRequest).scope,
         props: { userId: "alf-owner" },
       });
+      await env.CONFIG.delete(attemptsKey);
       return Response.redirect(redirectTo, 302);
     }
     return new Response("Not found", { status: 404 });
