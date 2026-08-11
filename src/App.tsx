@@ -96,7 +96,7 @@ function Dashboard({ dark, onThemeChange }: { dark: boolean; onThemeChange: () =
   const [group, setGroup] = useState("ALL");
   const [sortBy, setSortBy] = useState<"spend" | "cost">("spend");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  const [connectOpen, setConnectOpen] = useState(false);
+  const [connectOpen, setConnectOpen] = useState(() => new URLSearchParams(window.location.search).get("connect") === "mcp");
   const [connectStep, setConnectStep] = useState<"password" | "credentials">("password");
   const [connectPassword, setConnectPassword] = useState("");
   const [setupToken, setSetupToken] = useState("");
