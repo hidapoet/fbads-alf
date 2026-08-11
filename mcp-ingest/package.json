@@ -1,0 +1,15 @@
+{
+  "name": "alf-ads-ingest-mcp",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "0.10.3",
+    "agents": "0.20.1",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.120.1"
+  }
+}

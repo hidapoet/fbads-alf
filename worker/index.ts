@@ -181,6 +181,23 @@ async function fetchDashboard(request: Request, env: Env): Promise<Response> {
   const granularity = period === "realtime" ? "realtime" : "daily";
   const connection = await envReady(env);
 
+  const agentPayload = await env.CONFIG.get("agent:fb_ads_fact", "json");
+  if (isRecord(agentPayload) && Array.isArray(agentPayload.rows)) {
+    const rows = agentPayload.rows
+      .map(normalizeFact)
+      .filter((row): row is FactRow => row !== null && row.granularity === granularity && row.date >= from && row.date <= to);
+    if (rows.length > 0) {
+      const payload: DashboardResponse = {
+        rows,
+        source: "mcp_agent",
+        message: "Dữ liệu Meta Ads MCP được ChatGPT/Claude chuyển tự động lên dashboard.",
+        syncedAt: typeof agentPayload.receivedAt === "string" ? agentPayload.receivedAt : rows[0].updated_at,
+        connection,
+      };
+      return json(payload);
+    }
+  }
+
   if (connection.supabase) {
     const params = new URLSearchParams({
       select: "*",

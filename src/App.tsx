@@ -301,8 +301,8 @@ function Dashboard({ dark, onThemeChange }: { dark: boolean; onThemeChange: () =
           </div>
         </div>
         <div className="header-actions">
-          <Badge appearance="tint" color={response?.source === "mcp" || response?.source === "supabase" ? "success" : "warning"}>
-            {response?.source === "mcp" ? "MCP trực tiếp" : response?.source === "supabase" ? "Dữ liệu thật" : response?.source === "unavailable" ? "MCP chưa khả dụng" : "Dữ liệu minh họa"}
+          <Badge appearance="tint" color={response?.source === "mcp" || response?.source === "mcp_agent" || response?.source === "supabase" ? "success" : "warning"}>
+            {response?.source === "mcp_agent" ? "MCP qua ChatGPT/Claude" : response?.source === "mcp" ? "MCP trực tiếp" : response?.source === "supabase" ? "Dữ liệu thật" : response?.source === "unavailable" ? "MCP chưa khả dụng" : "Dữ liệu minh họa"}
           </Badge>
           <Button appearance="subtle" className="connect-shortcut" onClick={openConnectionDialog} aria-label="Trạng thái Facebook Ads MCP">
             <kbd>i</kbd><span>{mcpStatus.connected || response?.connection.meta ? "MCP đã kết nối" : "Kết nối MCP"}</span>

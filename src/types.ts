@@ -39,7 +39,7 @@ export interface FactRow {
 
 export interface DashboardResponse {
   rows: FactRow[];
-  source: "supabase" | "mcp" | "unavailable" | "demo";
+  source: "supabase" | "mcp" | "mcp_agent" | "unavailable" | "demo";
   message: string;
   syncedAt: string;
   connection: {

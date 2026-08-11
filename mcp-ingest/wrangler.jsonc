@@ -1,0 +1,35 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "fbads-alf-ingest-mcp",
+  "main": "index.ts",
+  "compatibility_date": "2026-08-11",
+  "compatibility_flags": ["nodejs_compat"],
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["AlfAdsIngestMcp"]
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "MCP_OBJECT",
+        "class_name": "AlfAdsIngestMcp"
+      }
+    ]
+  },
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      "id": "35cc3d04a5504dbfbb61ec5b7fe3a0c1"
+    },
+    {
+      "binding": "CONFIG",
+      "id": "35cc3d04a5504dbfbb61ec5b7fe3a0c1"
+    }
+  ],
+  "observability": {
+    "enabled": true,
+    "logs": { "head_sampling_rate": 1 }
+  }
+}
