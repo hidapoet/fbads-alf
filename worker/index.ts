@@ -35,6 +35,7 @@ type MetaConfig = {
 
 type StoredMetaConfig = MetaConfig & {
   connectedAt: string;
+  authMethod: "oauth" | "user_token";
 };
 
 type AdAccount = {
@@ -118,7 +119,7 @@ function dateInVietnam(offsetDays = 0): string {
 
 function explainMcpError(message: string): string {
   if (message.includes("not enabled for the Ads MCP")) {
-    return "OAuth đã kết nối, nhưng Meta chưa bật Ads MCP cho tài khoản quảng cáo này. Nhấn phím i, chọn Kết nối lại và dùng một tài khoản đã được Meta cấp Ads MCP.";
+    return "Đã xác thực, nhưng Meta chưa bật Ads MCP cho tài khoản quảng cáo này. Nhấn phím i, chọn Kết nối lại và dùng một tài khoản đã được Meta cấp Ads MCP.";
   }
   return message;
 }
@@ -157,7 +158,7 @@ async function envReady(env: Env): Promise<{ supabase: boolean; meta: boolean }>
   };
 }
 
-async function getMcpStatus(env: Env): Promise<{ connected: boolean; adAccountId?: string; connectedAt?: string; dataError?: string }> {
+async function getMcpStatus(env: Env): Promise<{ connected: boolean; adAccountId?: string; connectedAt?: string; authMethod?: "oauth" | "user_token"; dataError?: string }> {
   const [stored, dataError] = await Promise.all([
     env.CONFIG.get("meta:mcp", "json"),
     env.CONFIG.get("meta:mcp:last-error"),
@@ -169,6 +170,7 @@ async function getMcpStatus(env: Env): Promise<{ connected: boolean; adAccountId
     connected: true,
     ...(rawAccountId ? { adAccountId: `act_${rawAccountId}` } : {}),
     ...(typeof stored.connectedAt === "string" ? { connectedAt: stored.connectedAt } : {}),
+    ...(stored.authMethod === "oauth" || stored.authMethod === "user_token" ? { authMethod: stored.authMethod } : {}),
     ...(dataError ? { dataError } : {}),
   };
 }
@@ -797,13 +799,44 @@ async function getMcpOAuthResult(request: Request, env: Env): Promise<Response> 
   return json({ accounts: extractAccounts(selection.accounts) });
 }
 
-async function completeMcpOAuth(request: Request, env: Env): Promise<Response> {
+async function prepareMcpUserToken(request: Request, env: Env): Promise<Response> {
+  if (!env.OAUTH_STATE_SECRET) return json({ error: "Mã hóa kết nối MCP chưa được cấu hình." }, { status: 503 });
+  const body = await readSmallJson(request);
+  const setupToken = typeof body?.setupToken === "string" ? body.setupToken : "";
+  const accessToken = typeof body?.accessToken === "string" ? body.accessToken.trim() : "";
+  const setupKey = `mcp:setup:${setupToken}`;
+  const unlocked = setupToken.length <= 64 ? await env.CONFIG.get(setupKey) : null;
+  if (!unlocked) return json({ error: "Phiên mở khóa đã hết hạn. Hãy nhập lại mật khẩu." }, { status: 401 });
+  await env.CONFIG.delete(setupKey);
+  if (accessToken.length < 20 || accessToken.length > 4_096) {
+    return json({ error: "Mã truy cập người dùng không hợp lệ." }, { status: 400 });
+  }
+
+  try {
+    await mcpRequest(accessToken, "tools/list");
+    const accountResult = await mcpToolCall(accessToken, "ads_get_ad_accounts", {});
+    const accounts = extractAccounts(accountResult);
+    if (accounts.length === 0) {
+      return json({ error: "Ads MCP chưa trả về tài khoản quảng cáo nào cho mã truy cập này." }, { status: 422 });
+    }
+    const resultId = crypto.randomUUID();
+    const sealed = await sealOAuthState(env, { accessToken });
+    await env.CONFIG.put(`mcp:token-result:${resultId}`, JSON.stringify({ sealed, accounts }), { expirationTtl: 600 });
+    return json({ resultId, accounts });
+  } catch (error) {
+    const message = error instanceof Error ? explainMcpError(error.message) : "Ads MCP từ chối mã truy cập.";
+    return json({ error: message.slice(0, 500) }, { status: 422 });
+  }
+}
+
+async function completeMcpConnection(request: Request, env: Env, source: "oauth" | "user_token"): Promise<Response> {
   const body = await readSmallJson(request);
   const resultId = typeof body?.resultId === "string" ? body.resultId : "";
   const rawAccountId = typeof body?.adAccountId === "string" ? body.adAccountId.trim() : "";
   const adAccountId = rawAccountId.replace(/^act_/, "");
   if (!/^[0-9]{5,30}$/.test(adAccountId) || resultId.length > 64) return json({ error: "Tài khoản quảng cáo không hợp lệ." }, { status: 400 });
-  const selection = await env.CONFIG.get(`mcp:oauth-result:${resultId}`, "json");
+  const resultKey = source === "oauth" ? `mcp:oauth-result:${resultId}` : `mcp:token-result:${resultId}`;
+  const selection = await env.CONFIG.get(resultKey, "json");
   if (!isRecord(selection) || typeof selection.sealed !== "string" || !Array.isArray(selection.accounts)) {
     return json({ error: "Phiên chọn tài khoản đã hết hạn. Hãy đăng nhập lại." }, { status: 401 });
   }
@@ -820,14 +853,15 @@ async function completeMcpOAuth(request: Request, env: Env): Promise<Response> {
     refreshToken: typeof decrypted.refreshToken === "string" ? decrypted.refreshToken : undefined,
     expiresAt: typeof decrypted.expiresAt === "number" ? decrypted.expiresAt : undefined,
     connectedAt: new Date().toISOString(),
+    authMethod: source,
   };
   const sealedConfig = await sealOAuthState(env, stored);
   await Promise.all([
-    env.CONFIG.put("meta:mcp", JSON.stringify({ sealed: sealedConfig, adAccountId, connectedAt: stored.connectedAt })),
-    env.CONFIG.delete(`mcp:oauth-result:${resultId}`),
+    env.CONFIG.put("meta:mcp", JSON.stringify({ sealed: sealedConfig, adAccountId, connectedAt: stored.connectedAt, authMethod: source })),
+    env.CONFIG.delete(resultKey),
     env.CONFIG.delete("meta:mcp:last-error"),
   ]);
-  return json({ connected: true, adAccountId: `act_${adAccountId}`, connectedAt: stored.connectedAt });
+  return json({ connected: true, adAccountId: `act_${adAccountId}`, connectedAt: stored.connectedAt, authMethod: source });
 }
 
 async function handleApi(request: Request, env: Env): Promise<Response> {
@@ -839,7 +873,9 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   if (url.pathname === "/api/oauth/meta/start" && request.method === "GET") return startMcpOAuth(request, env);
   if (url.pathname === "/api/oauth/meta/callback" && request.method === "GET") return finishMcpOAuth(request, env);
   if (url.pathname === "/api/oauth/meta/result" && request.method === "GET") return getMcpOAuthResult(request, env);
-  if (url.pathname === "/api/oauth/meta/complete" && request.method === "POST") return completeMcpOAuth(request, env);
+  if (url.pathname === "/api/oauth/meta/complete" && request.method === "POST") return completeMcpConnection(request, env, "oauth");
+  if (url.pathname === "/api/mcp/token/accounts" && request.method === "POST") return prepareMcpUserToken(request, env);
+  if (url.pathname === "/api/mcp/token/complete" && request.method === "POST") return completeMcpConnection(request, env, "user_token");
   if (url.pathname === "/api/dashboard" && request.method === "GET") return fetchDashboard(request, env);
   if (url.pathname === "/api/sync" && request.method === "POST") {
     const authorized = await constantTimeEqual(request.headers.get("Authorization") ?? "", `Bearer ${env.SYNC_SECRET}`);
