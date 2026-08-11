@@ -1,0 +1,17 @@
+# Local environment files may contain Supabase secrets.
+.env
+.env.*
+!.env.example
+
+# Supabase CLI local state.
+.supabase/
+.wrangler/
+.dev.vars*
+node_modules/
+.pnpm-store/
+dist/
+worker-configuration.d.ts
+dashboard-*.png
+*-local.*.log
+.npm-cache/
+*.tsbuildinfo
