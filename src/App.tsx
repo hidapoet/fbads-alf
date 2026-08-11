@@ -59,7 +59,8 @@ const GROUP_LABEL: Record<ResultGroup, string> = {
 const money = new Intl.NumberFormat("vi-VN", { style: "currency", currency: "VND", maximumFractionDigits: 0 });
 const number = new Intl.NumberFormat("vi-VN", { maximumFractionDigits: 1 });
 
-type McpAdAccount = { id: string; name: string; currency?: string; status?: string; timezone?: string };
+type McpAdAccount = { id: string; name: string; currency?: string; status?: string; timezone?: string; mcpEnabled?: boolean };
+type McpStatus = { connected: boolean; adAccountId?: string; connectedAt?: string; dataError?: string };
 
 function defaultRange() {
   const to = new Date();
@@ -99,13 +100,14 @@ function Dashboard({ dark, onThemeChange }: { dark: boolean; onThemeChange: () =
   const [sortBy, setSortBy] = useState<"spend" | "cost">("spend");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [connectOpen, setConnectOpen] = useState(() => new URLSearchParams(window.location.search).get("connect") === "mcp");
-  const [connectStep, setConnectStep] = useState<"password" | "accounts">(() => new URLSearchParams(window.location.search).has("oauth_result") ? "accounts" : "password");
+  const [connectStep, setConnectStep] = useState<"password" | "accounts" | "status">(() => new URLSearchParams(window.location.search).has("oauth_result") ? "accounts" : "password");
   const [connectPassword, setConnectPassword] = useState("");
   const [oauthResultId, setOauthResultId] = useState(() => new URLSearchParams(window.location.search).get("oauth_result") ?? "");
   const [mcpAccounts, setMcpAccounts] = useState<McpAdAccount[]>([]);
   const [adAccountId, setAdAccountId] = useState("");
   const [connectBusy, setConnectBusy] = useState(false);
   const [connectError, setConnectError] = useState<string | null>(null);
+  const [mcpStatus, setMcpStatus] = useState<McpStatus>({ connected: false });
 
   const load = useCallback(async (quiet = false) => {
     if (!quiet) setLoading(true);
@@ -126,6 +128,23 @@ function Dashboard({ dark, onThemeChange }: { dark: boolean; onThemeChange: () =
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const result = await fetch("/api/mcp/status");
+        if (!result.ok) return;
+        const statusPayload = await result.json() as McpStatus;
+        setMcpStatus(statusPayload);
+        const params = new URLSearchParams(window.location.search);
+        if (statusPayload.connected && params.get("connect") === "mcp" && !params.has("oauth_result") && !params.has("oauth_error")) {
+          setConnectStep("status");
+        }
+      } catch {
+        // Dashboard connection status remains the fallback indicator.
+      }
+    })();
+  }, []);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -156,18 +175,24 @@ function Dashboard({ dark, onThemeChange }: { dark: boolean; onThemeChange: () =
     })();
   }, []);
 
+  function openConnectionDialog() {
+    setConnectError(null);
+    setConnectStep(mcpStatus.connected || response?.connection.meta ? "status" : "password");
+    setConnectOpen(true);
+  }
+
   useEffect(() => {
     const openWithShortcut = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
       const isEditing = target?.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target?.tagName ?? "");
       if (event.key.toLocaleLowerCase() === "i" && !event.ctrlKey && !event.metaKey && !event.altKey && !isEditing) {
         event.preventDefault();
-        setConnectOpen(true);
+        openConnectionDialog();
       }
     };
     window.addEventListener("keydown", openWithShortcut);
     return () => window.removeEventListener("keydown", openWithShortcut);
-  }, []);
+  }, [mcpStatus.connected, response?.connection.meta]);
 
   useEffect(() => {
     if (period !== "realtime" || response?.source !== "supabase") return;
@@ -252,8 +277,9 @@ function Dashboard({ dark, onThemeChange }: { dark: boolean; onThemeChange: () =
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ resultId: oauthResultId, adAccountId }),
       });
-      const payload = await result.json() as { error?: string };
+      const payload = await result.json() as McpStatus & { error?: string };
       if (!result.ok) throw new Error(payload.error ?? "Không thể kết nối Facebook Ads MCP.");
+      setMcpStatus(payload);
       setConnectOpen(false);
       resetConnectionDialog();
       await load();
@@ -275,11 +301,11 @@ function Dashboard({ dark, onThemeChange }: { dark: boolean; onThemeChange: () =
           </div>
         </div>
         <div className="header-actions">
-          <Badge appearance="tint" color={response?.source === "supabase" ? "success" : "warning"}>
-            {response?.source === "supabase" ? "Dữ liệu thật" : "Dữ liệu minh họa"}
+          <Badge appearance="tint" color={response?.source && response.source !== "demo" ? "success" : "warning"}>
+            {response?.source === "mcp" ? "MCP trực tiếp" : response?.source === "supabase" ? "Dữ liệu thật" : "Dữ liệu minh họa"}
           </Badge>
-          <Button appearance="subtle" className="connect-shortcut" onClick={() => setConnectOpen(true)} aria-label="Kết nối Facebook Ads MCP">
-            <kbd>i</kbd><span>Kết nối MCP</span>
+          <Button appearance="subtle" className="connect-shortcut" onClick={openConnectionDialog} aria-label="Trạng thái Facebook Ads MCP">
+            <kbd>i</kbd><span>{mcpStatus.connected || response?.connection.meta ? "MCP đã kết nối" : "Kết nối MCP"}</span>
           </Button>
           <Button appearance="subtle" onClick={onThemeChange} aria-label="Đổi giao diện sáng tối">{dark ? "Sáng" : "Tối"}</Button>
           <Button appearance="primary" onClick={() => void load()} disabled={loading}>
@@ -405,7 +431,7 @@ function Dashboard({ dark, onThemeChange }: { dark: boolean; onThemeChange: () =
       }}>
         <DialogSurface className="connect-dialog">
           <DialogBody>
-            <DialogTitle>{connectStep === "password" ? "Đăng nhập Facebook Ads MCP" : "Chọn tài khoản quảng cáo"}</DialogTitle>
+            <DialogTitle>{connectStep === "password" ? "Đăng nhập Facebook Ads MCP" : connectStep === "accounts" ? "Chọn tài khoản quảng cáo" : "Trạng thái Meta Ads MCP"}</DialogTitle>
             <DialogContent className="connect-dialog-content">
               {connectStep === "password" ? (
                 <>
@@ -416,7 +442,7 @@ function Dashboard({ dark, onThemeChange }: { dark: boolean; onThemeChange: () =
                     }} />
                   </Field>
                 </>
-              ) : (
+              ) : connectStep === "accounts" ? (
                 <>
                   <p>Danh sách này được lấy trực tiếp bằng MCP tool <code>ads_get_ad_accounts</code>. Chọn tài khoản cần theo dõi.</p>
                   <Field label="Tài khoản quảng cáo" required>
@@ -428,11 +454,26 @@ function Dashboard({ dark, onThemeChange }: { dark: boolean; onThemeChange: () =
                     >
                       {mcpAccounts.map((account) => (
                         <Option key={account.id} value={account.id} text={`${account.name} · act_${account.id}`}>
-                          {account.name} · act_{account.id}{account.currency ? ` · ${account.currency}` : ""}
+                          {account.name} · act_{account.id}{account.currency ? ` · ${account.currency}` : ""}{account.mcpEnabled === false ? " · MCP chưa khả dụng" : ""}
                         </Option>
                       ))}
                     </Dropdown>
                   </Field>
+                </>
+              ) : (
+                <>
+                  <MessageBar intent={mcpStatus.dataError || (response?.source === "demo" && response.connection.meta) ? "warning" : "success"}>
+                    <MessageBarBody>
+                      <MessageBarTitle>{mcpStatus.dataError || (response?.source === "demo" && response.connection.meta) ? "OAuth đã kết nối, dữ liệu MCP chưa khả dụng" : "Đã kết nối thành công"}</MessageBarTitle>
+                      {mcpStatus.dataError ?? (response?.source === "demo" && response.connection.meta ? response.message : "Web đang dùng phiên OAuth của Meta Ads MCP để đọc số liệu quảng cáo.")}
+                    </MessageBarBody>
+                  </MessageBar>
+                  <div className="connection-details">
+                    <span>Tài khoản quảng cáo</span>
+                    <strong>{mcpStatus.adAccountId ?? "Đã chọn trên Meta"}</strong>
+                    {mcpStatus.connectedAt && <small>Kết nối lúc {new Date(mcpStatus.connectedAt).toLocaleString("vi-VN")}</small>}
+                  </div>
+                  <p>Nhấn <strong>Làm mới dữ liệu</strong> để kéo lại chỉ số trực tiếp từ MCP. Chỉ kết nối lại khi muốn đổi tài khoản hoặc phiên Facebook hết hạn.</p>
                 </>
               )}
               {connectError && <MessageBar intent="error"><MessageBarBody>{connectError}</MessageBarBody></MessageBar>}
@@ -443,10 +484,15 @@ function Dashboard({ dark, onThemeChange }: { dark: boolean; onThemeChange: () =
                 <Button appearance="primary" onClick={() => void unlockConnection()} disabled={connectBusy || !connectPassword}>
                   {connectBusy ? <Spinner size="tiny" /> : "Tiếp tục"}
                 </Button>
-              ) : (
+              ) : connectStep === "accounts" ? (
                 <Button appearance="primary" onClick={() => void completeMcpConnection()} disabled={connectBusy || !oauthResultId || !adAccountId}>
                   {connectBusy ? <Spinner size="tiny" /> : "Theo dõi tài khoản này"}
                 </Button>
+              ) : (
+                <>
+                  <Button appearance="secondary" onClick={() => setConnectStep("password")}>Kết nối lại</Button>
+                  <Button appearance="primary" onClick={() => { setConnectOpen(false); void load(); }} disabled={loading}>Làm mới dữ liệu</Button>
+                </>
               )}
             </DialogActions>
           </DialogBody>

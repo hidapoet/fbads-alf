@@ -43,6 +43,7 @@ type AdAccount = {
   currency?: string;
   status?: string;
   timezone?: string;
+  mcpEnabled?: boolean;
 };
 
 type OAuthSelection = {
@@ -149,6 +150,22 @@ async function envReady(env: Env): Promise<{ supabase: boolean; meta: boolean }>
   };
 }
 
+async function getMcpStatus(env: Env): Promise<{ connected: boolean; adAccountId?: string; connectedAt?: string; dataError?: string }> {
+  const [stored, dataError] = await Promise.all([
+    env.CONFIG.get("meta:mcp", "json"),
+    env.CONFIG.get("meta:mcp:last-error"),
+  ]);
+  const connected = Boolean(await getMetaConfig(env));
+  if (!connected || !isRecord(stored)) return { connected };
+  const rawAccountId = typeof stored.adAccountId === "string" ? stored.adAccountId.replace(/^act_/, "") : "";
+  return {
+    connected: true,
+    ...(rawAccountId ? { adAccountId: `act_${rawAccountId}` } : {}),
+    ...(typeof stored.connectedAt === "string" ? { connectedAt: stored.connectedAt } : {}),
+    ...(dataError ? { dataError } : {}),
+  };
+}
+
 async function fetchDashboard(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const period = url.searchParams.get("period") ?? "daily";
@@ -187,12 +204,38 @@ async function fetchDashboard(request: Request, env: Env): Promise<Response> {
     }
   }
 
+  let mcpError = "";
+  if (connection.meta) {
+    try {
+      const meta = await getMetaConfig(env);
+      if (meta) {
+        const rows = await readMcpRows(env, meta, granularity, from, to);
+        if (rows.length > 0) {
+          await env.CONFIG.delete("meta:mcp:last-error");
+          const payload: DashboardResponse = {
+            rows,
+            source: "mcp",
+            message: "Dữ liệu được đọc trực tiếp từ Meta Ads MCP.",
+            syncedAt: rows.reduce((latest, row) => row.updated_at > latest ? row.updated_at : latest, rows[0].updated_at),
+            connection,
+          };
+          return json(payload);
+        }
+        mcpError = "Meta Ads MCP không trả về bản ghi nào trong khoảng ngày đã chọn.";
+      }
+    } catch (error) {
+      mcpError = error instanceof Error ? error.message : "Không thể đọc dữ liệu từ Meta Ads MCP.";
+      await env.CONFIG.put("meta:mcp:last-error", mcpError.slice(0, 500), { expirationTtl: 86_400 });
+      console.error(JSON.stringify({ message: "MCP dashboard query failed", error: mcpError }));
+    }
+  }
+
   const payload: DashboardResponse = {
     rows: SAMPLE_ROWS.filter((row) => granularity === "realtime" ? row.granularity === "realtime" : true),
     source: "demo",
-    message: connection.supabase
+    message: mcpError || (connection.supabase
       ? "Supabase chưa có dữ liệu hoặc bảng fb_ads_fact chưa được tạo."
-      : "Chưa cấu hình kết nối Supabase phía Worker.",
+      : "Chưa cấu hình kết nối Supabase phía Worker."),
     syncedAt: new Date().toISOString(),
     connection,
   };
@@ -320,7 +363,7 @@ async function mcpRequest(accessToken: string, method: string, params?: Record<s
     body: JSON.stringify({ jsonrpc: "2.0", id: crypto.randomUUID(), method, ...(params ? { params } : {}) }),
   });
   const text = await readBoundedText(response);
-  if (!response.ok) throw new Error(`Meta MCP returned ${response.status}`);
+  if (!response.ok) throw new Error(`Meta MCP returned ${response.status}: ${text.replace(/\s+/g, " ").slice(0, 500)}`);
   const payload = parseMcpPayload(text, response.headers.get("Content-Type") ?? "application/json");
   if (!isRecord(payload)) throw new Error("Meta MCP returned an invalid JSON-RPC response");
   if (isRecord(payload.error)) throw new Error(typeof payload.error.message === "string" ? payload.error.message : "Meta MCP tool call failed");
@@ -330,7 +373,11 @@ async function mcpRequest(accessToken: string, method: string, params?: Record<s
 async function mcpToolCall(accessToken: string, name: string, args: Record<string, unknown>): Promise<unknown> {
   const result = await mcpRequest(accessToken, "tools/call", { name, arguments: args });
   if (isRecord(result) && result.isError === true) {
-    throw new Error("Meta MCP reported a tool error");
+    const detail = Array.isArray(result.content)
+      ? result.content.find((item) => isRecord(item) && item.type === "text" && typeof item.text === "string")
+      : null;
+    const message = isRecord(detail) && typeof detail.text === "string" ? detail.text.slice(0, 500) : "Meta MCP reported a tool error";
+    throw new Error(message);
   }
   return result;
 }
@@ -364,6 +411,7 @@ function extractAccounts(value: unknown): AdAccount[] {
         currency: typeof candidate.currency === "string" ? candidate.currency : undefined,
         status: typeof candidate.account_status === "string" || typeof candidate.account_status === "number" ? String(candidate.account_status) : undefined,
         timezone: typeof candidate.timezone_name === "string" ? candidate.timezone_name : undefined,
+        mcpEnabled: typeof candidate.is_ads_mcp_enabled === "boolean" ? candidate.is_ads_mcp_enabled : undefined,
       });
     }
     Object.values(candidate).forEach(visit);
@@ -390,6 +438,9 @@ function recordToInsight(record: Record<string, unknown>): MetaInsight | null {
     const item = value[key];
     return typeof item === "string" || typeof item === "number" ? String(item) : undefined;
   };
+  const flatActions = Object.entries(value)
+    .filter(([key, item]) => key.startsWith("actions:") && (typeof item === "string" || typeof item === "number"))
+    .map(([key, item]) => ({ action_type: key.slice("actions:".length), value: String(item) }));
   return {
     date_start: stringValue("date_start") ?? stringValue("date"),
     campaign_id: stringValue("campaign_id"),
@@ -400,14 +451,14 @@ function recordToInsight(record: Record<string, unknown>): MetaInsight | null {
     ad_name: stringValue("ad_name") ?? stringValue("name"),
     objective: stringValue("objective"),
     optimization_goal: stringValue("optimization_goal"),
-    spend: stringValue("spend"),
+    spend: stringValue("spend") ?? stringValue("amount_spent"),
     impressions: stringValue("impressions"),
     reach: stringValue("reach"),
     frequency: stringValue("frequency"),
     ctr: stringValue("ctr"),
     cpc: stringValue("cpc"),
     cpm: stringValue("cpm"),
-    actions: toMetaActions(value.actions),
+    actions: [...(toMetaActions(value.actions) ?? []), ...flatActions],
     cost_per_action_type: toMetaActions(value.cost_per_action_type),
     estimated_ad_recallers: stringValue("estimated_ad_recallers"),
     effective_status: stringValue("effective_status") ?? stringValue("status"),
@@ -438,7 +489,7 @@ function schemaProperty(schema: Record<string, unknown>, key: string): Record<st
   return isRecord(schema.properties) && isRecord(schema.properties[key]) ? schema.properties[key] : null;
 }
 
-function buildAdEntityArgs(schema: Record<string, unknown>, adAccountId: string, date: string): Record<string, unknown> {
+function buildAdEntityArgs(schema: Record<string, unknown>, adAccountId: string, from: string, to: string): Record<string, unknown> {
   const args: Record<string, unknown> = {};
   const assignFirst = (keys: string[], value: unknown): boolean => {
     const key = keys.find((candidate) => schemaProperty(schema, candidate));
@@ -446,17 +497,21 @@ function buildAdEntityArgs(schema: Record<string, unknown>, adAccountId: string,
     args[key] = value;
     return true;
   };
-  assignFirst(["ad_account_id", "account_id"], `act_${adAccountId}`);
+  assignFirst(["ad_account_id", "account_id"], adAccountId.replace(/^act_/, ""));
   assignFirst(["entity_type", "entity_level", "level"], "ad");
-  assignFirst(["time_range", "date_range"], { since: date, until: date });
-  assignFirst(["since", "start_date"], date);
-  assignFirst(["until", "end_date"], date);
+  const rangeKey = ["time_range", "date_range"].find((key) => schemaProperty(schema, key));
+  if (rangeKey) {
+    const property = schemaProperty(schema, rangeKey);
+    args[rangeKey] = property?.type === "string" ? JSON.stringify({ since: from, until: to }) : { since: from, until: to };
+  }
+  assignFirst(["since", "start_date"], from);
+  assignFirst(["until", "end_date"], to);
   assignFirst(["include_insights", "include_metrics", "with_insights"], true);
+  assignFirst(["time_increment"], "1");
   assignFirst(["limit"], 500);
   const fields = [
-    "campaign_id", "campaign_name", "adset_id", "adset_name", "ad_id", "ad_name", "objective",
-    "optimization_goal", "spend", "impressions", "reach", "frequency", "ctr", "cpc", "cpm",
-    "actions", "cost_per_action_type", "estimated_ad_recallers", "effective_status", "date_start",
+    "id", "name", "campaign_id", "adset_id", "objective", "amount_spent", "impressions", "reach",
+    "frequency", "ctr", "cpc", "cpm", "clicks", "actions:link_click", "cost_per_action_type", "effective_status",
   ];
   const fieldsKey = ["fields", "metrics"].find((key) => schemaProperty(schema, key));
   if (fieldsKey) args[fieldsKey] = schemaProperty(schema, fieldsKey)?.type === "string" ? fields.join(",") : fields;
@@ -474,13 +529,12 @@ async function getAdEntitySchema(env: Env, accessToken: string): Promise<Record<
   return tool.inputSchema;
 }
 
-async function readMcpRows(env: Env, meta: MetaConfig, granularity: "realtime" | "daily"): Promise<FactRow[]> {
-  const date = dateInVietnam();
+async function readMcpRows(env: Env, meta: MetaConfig, granularity: "realtime" | "daily", from = dateInVietnam(), to = dateInVietnam()): Promise<FactRow[]> {
   const schema = await getAdEntitySchema(env, meta.accessToken);
-  const result = await mcpToolCall(meta.accessToken, "ads_get_ad_entities", buildAdEntityArgs(schema, meta.adAccountId, date));
+  const result = await mcpToolCall(meta.accessToken, "ads_get_ad_entities", buildAdEntityArgs(schema, meta.adAccountId, from, to));
   const unique = new Map<string, FactRow>();
   for (const insight of extractInsights(result)) {
-    insight.date_start ??= date;
+    insight.date_start ??= to;
     const row = insightToFact(insight, granularity);
     if (row) unique.set(`${row.date}:${row.ad_id}`, row);
   }
@@ -746,6 +800,7 @@ async function completeMcpOAuth(request: Request, env: Env): Promise<Response> {
   await Promise.all([
     env.CONFIG.put("meta:mcp", JSON.stringify({ sealed: sealedConfig, adAccountId, connectedAt: stored.connectedAt })),
     env.CONFIG.delete(`mcp:oauth-result:${resultId}`),
+    env.CONFIG.delete("meta:mcp:last-error"),
   ]);
   return json({ connected: true, adAccountId: `act_${adAccountId}`, connectedAt: stored.connectedAt });
 }
@@ -754,7 +809,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   if (url.pathname === "/api/health") return json({ ok: true, connection: await envReady(env), time: new Date().toISOString() });
   if (url.pathname === "/api/config") return json({ url: env.SUPABASE_URL, publishableKey: env.SUPABASE_PUBLISHABLE_KEY });
-  if (url.pathname === "/api/mcp/status" && request.method === "GET") return json({ connected: Boolean(await getMetaConfig(env)) });
+  if (url.pathname === "/api/mcp/status" && request.method === "GET") return json(await getMcpStatus(env));
   if (url.pathname === "/api/mcp/unlock" && request.method === "POST") return unlockMcp(request, env);
   if (url.pathname === "/api/oauth/meta/start" && request.method === "GET") return startMcpOAuth(request, env);
   if (url.pathname === "/api/oauth/meta/callback" && request.method === "GET") return finishMcpOAuth(request, env);

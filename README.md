@@ -5,11 +5,11 @@ Dashboard theo dõi Facebook Ads theo campaign, ad set và ad. Hệ thống chu�
 ## Kiến trúc
 
 - React + Fluent UI: dashboard responsive, bộ lọc, KPI, biểu đồ và bảng cây.
-- Cloudflare Worker: API đọc báo cáo, cron đồng bộ Meta Marketing API và phục vụ static assets.
+- Cloudflare Worker: OAuth, JSON-RPC client cho Meta Ads MCP, API báo cáo, cron đồng bộ và static assets.
 - Supabase: bảng fact theo ngày/realtime, views tuần/tháng, RLS chỉ đọc và Realtime.
 - GitHub Actions: typecheck, build, deploy Worker và migration khi đủ secrets.
 
-Meta Ads MCP được dùng để khám phá và xác nhận field trong phiên agent. Job production gọi Meta Graph API trực tiếp vì Worker không duy trì phiên MCP tương tác.
+Worker gọi trực tiếp máy chủ `https://mcp.facebook.com/ads` qua JSON-RPC và tool `ads_get_ad_entities`; không gọi Meta Graph Marketing API. Supabase là bộ nhớ đệm tùy chọn: khi bảng chưa sẵn sàng, dashboard đọc trực tiếp từ MCP. Meta đang triển khai Ads MCP theo từng tài khoản nên OAuth có thể thành công trong khi một ad account cụ thể vẫn trả trạng thái chưa được bật MCP.
 
 ## Chạy cục bộ
 
@@ -23,8 +23,8 @@ Tạo `.dev.vars` với các biến server-only:
 
 ```text
 SUPABASE_SECRET_KEY=
-META_ACCESS_TOKEN=
-META_AD_ACCOUNT_ID=
+CONNECT_PASSWORD=
+OAUTH_STATE_SECRET=
 SYNC_SECRET=
 ```
 
@@ -42,8 +42,8 @@ Sau lần deploy đầu, đặt secrets bằng `wrangler secret put`:
 
 ```bash
 wrangler secret put SUPABASE_SECRET_KEY
-wrangler secret put META_ACCESS_TOKEN
-wrangler secret put META_AD_ACCOUNT_ID
+wrangler secret put CONNECT_PASSWORD
+wrangler secret put OAUTH_STATE_SECRET
 wrangler secret put SYNC_SECRET
 ```
 

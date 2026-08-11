@@ -39,7 +39,7 @@ export interface FactRow {
 
 export interface DashboardResponse {
   rows: FactRow[];
-  source: "supabase" | "demo";
+  source: "supabase" | "mcp" | "demo";
   message: string;
   syncedAt: string;
   connection: {
@@ -47,4 +47,3 @@ export interface DashboardResponse {
     meta: boolean;
   };
 }
-
