@@ -17,7 +17,7 @@
   "vars": {
     "SUPABASE_URL": "https://aixjkcqupoysdiqcopke.supabase.co",
     "SUPABASE_PUBLISHABLE_KEY": "sb_publishable_qNMn7TMVQbbbr4Tema8mvA_CsrXEWQO",
-    "META_API_VERSION": "v25.0"
+    "META_APP_ID": "2102734267288241"
   },
   "triggers": {
     "crons": ["*/10 * * * *", "0 16 * * *"]

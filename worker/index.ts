@@ -26,20 +26,38 @@ type MetaInsight = {
   effective_status?: string;
 };
 
-type MetaPage = {
-  data?: MetaInsight[];
-  paging?: { next?: string };
-  error?: { message?: string };
-};
-
 type MetaConfig = {
   accessToken: string;
   adAccountId: string;
+  refreshToken?: string;
+  expiresAt?: number;
 };
 
 type StoredMetaConfig = MetaConfig & {
   connectedAt: string;
 };
+
+type AdAccount = {
+  id: string;
+  name: string;
+  currency?: string;
+  status?: string;
+  timezone?: string;
+};
+
+type OAuthSelection = {
+  accessToken: string;
+  refreshToken?: string;
+  expiresAt?: number;
+  accounts: AdAccount[];
+};
+
+const MCP_ENDPOINT = "https://mcp.facebook.com/ads";
+const MCP_AUTH_METADATA_ENDPOINT = "https://mcp.facebook.com/.well-known/oauth-authorization-server/ads";
+const MCP_SCOPES = [
+  "ads_management", "ads_read", "catalog_management", "business_management",
+  "pages_show_list", "instagram_basic", "ads_mcp_management",
+];
 
 const jsonHeaders = {
   "Content-Type": "application/json; charset=utf-8",
@@ -99,8 +117,24 @@ function dateInVietnam(offsetDays = 0): string {
 
 async function getMetaConfig(env: Env): Promise<MetaConfig | null> {
   const stored = await env.CONFIG.get("meta:mcp", "json");
+  if (isRecord(stored) && typeof stored.sealed === "string") {
+    const decrypted = await openOAuthState(env, stored.sealed);
+    if (isRecord(decrypted) && typeof decrypted.accessToken === "string" && typeof decrypted.adAccountId === "string") {
+      return {
+        accessToken: decrypted.accessToken,
+        adAccountId: decrypted.adAccountId,
+        refreshToken: typeof decrypted.refreshToken === "string" ? decrypted.refreshToken : undefined,
+        expiresAt: typeof decrypted.expiresAt === "number" ? decrypted.expiresAt : undefined,
+      };
+    }
+  }
   if (isRecord(stored) && typeof stored.accessToken === "string" && typeof stored.adAccountId === "string") {
-    return { accessToken: stored.accessToken, adAccountId: stored.adAccountId };
+    return {
+      accessToken: stored.accessToken,
+      adAccountId: stored.adAccountId,
+      refreshToken: typeof stored.refreshToken === "string" ? stored.refreshToken : undefined,
+      expiresAt: typeof stored.expiresAt === "number" ? stored.expiresAt : undefined,
+    };
   }
   if (env.META_ACCESS_TOKEN && env.META_AD_ACCOUNT_ID) {
     return { accessToken: env.META_ACCESS_TOKEN, adAccountId: env.META_AD_ACCOUNT_ID };
@@ -242,36 +276,215 @@ function insightToFact(insight: MetaInsight, granularity: "realtime" | "daily"):
   };
 }
 
-async function readMetaRows(env: Env, meta: MetaConfig, granularity: "realtime" | "daily"): Promise<FactRow[]> {
-  const date = dateInVietnam();
-  const fields = [
-    "date_start", "campaign_id", "campaign_name", "adset_id", "adset_name", "ad_id", "ad_name",
-    "objective", "optimization_goal", "spend", "impressions", "reach", "frequency", "ctr", "cpc", "cpm",
-    "actions", "cost_per_action_type", "estimated_ad_recallers", "effective_status",
-  ].join(",");
-  const params = new URLSearchParams({
-    access_token: meta.accessToken,
-    level: "ad",
-    fields,
-    time_range: JSON.stringify({ since: date, until: date }),
-    time_increment: "1",
-    limit: "500",
-  });
-  let next: string | undefined = `https://graph.facebook.com/${env.META_API_VERSION}/act_${meta.adAccountId}/insights?${params}`;
-  const rows: FactRow[] = [];
-  let pages = 0;
-  while (next && pages < 50) {
-    const response = await fetch(next);
-    const payload = (await response.json()) as MetaPage;
-    if (!response.ok || payload.error) throw new Error(payload.error?.message ?? `Meta API returned ${response.status}`);
-    (payload.data ?? []).forEach((insight) => {
-      const row = insightToFact(insight, granularity);
-      if (row) rows.push(row);
-    });
-    next = payload.paging?.next;
-    pages += 1;
+async function readBoundedText(response: Response, maxBytes = 2_000_000): Promise<string> {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let received = 0;
+  let text = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    received += value.byteLength;
+    if (received > maxBytes) {
+      await reader.cancel();
+      throw new Error("Meta MCP response is too large");
+    }
+    text += decoder.decode(value, { stream: true });
   }
-  return rows;
+  return text + decoder.decode();
+}
+
+function parseMcpPayload(text: string, contentType: string): unknown {
+  if (contentType.includes("text/event-stream")) {
+    for (const line of text.split(/\r?\n/)) {
+      if (!line.startsWith("data:")) continue;
+      const data = line.slice(5).trim();
+      if (!data || data === "[DONE]") continue;
+      try { return JSON.parse(data) as unknown; } catch { /* Continue to the next event. */ }
+    }
+    throw new Error("Meta MCP returned an invalid event stream");
+  }
+  return JSON.parse(text) as unknown;
+}
+
+async function mcpRequest(accessToken: string, method: string, params?: Record<string, unknown>): Promise<unknown> {
+  const response = await fetch(MCP_ENDPOINT, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: "application/json, text/event-stream",
+      "Content-Type": "application/json",
+      "MCP-Protocol-Version": "2025-06-18",
+    },
+    body: JSON.stringify({ jsonrpc: "2.0", id: crypto.randomUUID(), method, ...(params ? { params } : {}) }),
+  });
+  const text = await readBoundedText(response);
+  if (!response.ok) throw new Error(`Meta MCP returned ${response.status}`);
+  const payload = parseMcpPayload(text, response.headers.get("Content-Type") ?? "application/json");
+  if (!isRecord(payload)) throw new Error("Meta MCP returned an invalid JSON-RPC response");
+  if (isRecord(payload.error)) throw new Error(typeof payload.error.message === "string" ? payload.error.message : "Meta MCP tool call failed");
+  return payload.result;
+}
+
+async function mcpToolCall(accessToken: string, name: string, args: Record<string, unknown>): Promise<unknown> {
+  const result = await mcpRequest(accessToken, "tools/call", { name, arguments: args });
+  if (isRecord(result) && result.isError === true) {
+    throw new Error("Meta MCP reported a tool error");
+  }
+  return result;
+}
+
+function parseEmbeddedJson(text: string): unknown | null {
+  const cleaned = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  try { return JSON.parse(cleaned) as unknown; } catch { return null; }
+}
+
+function extractAccounts(value: unknown): AdAccount[] {
+  const accounts = new Map<string, AdAccount>();
+  const visit = (candidate: unknown): void => {
+    if (Array.isArray(candidate)) {
+      candidate.forEach(visit);
+      return;
+    }
+    if (!isRecord(candidate)) return;
+    if (candidate.type === "text" && typeof candidate.text === "string") {
+      const embedded = parseEmbeddedJson(candidate.text);
+      if (embedded !== null) visit(embedded);
+    }
+    const rawId = candidate.account_id ?? candidate.ad_account_id ?? candidate.id;
+    const id = typeof rawId === "string" || typeof rawId === "number" ? String(rawId).replace(/^act_/, "") : "";
+    const looksLikeAccount = /^[0-9]{5,30}$/.test(id) && (
+      "account_id" in candidate || "ad_account_id" in candidate || "currency" in candidate || "account_status" in candidate
+    );
+    if (looksLikeAccount) {
+      accounts.set(id, {
+        id,
+        name: typeof candidate.name === "string" ? candidate.name : `Tài khoản ${id}`,
+        currency: typeof candidate.currency === "string" ? candidate.currency : undefined,
+        status: typeof candidate.account_status === "string" || typeof candidate.account_status === "number" ? String(candidate.account_status) : undefined,
+        timezone: typeof candidate.timezone_name === "string" ? candidate.timezone_name : undefined,
+      });
+    }
+    Object.values(candidate).forEach(visit);
+  };
+  visit(value);
+  return [...accounts.values()];
+}
+
+function toMetaActions(value: unknown): MetaAction[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.filter(isRecord).map((item) => ({
+    action_type: typeof item.action_type === "string" ? item.action_type : undefined,
+    value: typeof item.value === "string" || typeof item.value === "number" ? String(item.value) : undefined,
+  }));
+}
+
+function recordToInsight(record: Record<string, unknown>): MetaInsight | null {
+  const nested = isRecord(record.insights) ? record.insights : isRecord(record.metrics) ? record.metrics : {};
+  const value = { ...record, ...nested };
+  const entityType = typeof value.entity_type === "string" ? value.entity_type.toUpperCase() : "";
+  const adIdValue = value.ad_id ?? (entityType === "AD" ? value.id : undefined);
+  if (typeof adIdValue !== "string" && typeof adIdValue !== "number") return null;
+  const stringValue = (key: string): string | undefined => {
+    const item = value[key];
+    return typeof item === "string" || typeof item === "number" ? String(item) : undefined;
+  };
+  return {
+    date_start: stringValue("date_start") ?? stringValue("date"),
+    campaign_id: stringValue("campaign_id"),
+    campaign_name: stringValue("campaign_name"),
+    adset_id: stringValue("adset_id"),
+    adset_name: stringValue("adset_name"),
+    ad_id: String(adIdValue),
+    ad_name: stringValue("ad_name") ?? stringValue("name"),
+    objective: stringValue("objective"),
+    optimization_goal: stringValue("optimization_goal"),
+    spend: stringValue("spend"),
+    impressions: stringValue("impressions"),
+    reach: stringValue("reach"),
+    frequency: stringValue("frequency"),
+    ctr: stringValue("ctr"),
+    cpc: stringValue("cpc"),
+    cpm: stringValue("cpm"),
+    actions: toMetaActions(value.actions),
+    cost_per_action_type: toMetaActions(value.cost_per_action_type),
+    estimated_ad_recallers: stringValue("estimated_ad_recallers"),
+    effective_status: stringValue("effective_status") ?? stringValue("status"),
+  };
+}
+
+function extractInsights(value: unknown): MetaInsight[] {
+  const insights: MetaInsight[] = [];
+  const visit = (candidate: unknown): void => {
+    if (Array.isArray(candidate)) {
+      candidate.forEach(visit);
+      return;
+    }
+    if (!isRecord(candidate)) return;
+    if (candidate.type === "text" && typeof candidate.text === "string") {
+      const embedded = parseEmbeddedJson(candidate.text);
+      if (embedded !== null) visit(embedded);
+    }
+    const insight = recordToInsight(candidate);
+    if (insight) insights.push(insight);
+    Object.values(candidate).forEach(visit);
+  };
+  visit(value);
+  return insights;
+}
+
+function schemaProperty(schema: Record<string, unknown>, key: string): Record<string, unknown> | null {
+  return isRecord(schema.properties) && isRecord(schema.properties[key]) ? schema.properties[key] : null;
+}
+
+function buildAdEntityArgs(schema: Record<string, unknown>, adAccountId: string, date: string): Record<string, unknown> {
+  const args: Record<string, unknown> = {};
+  const assignFirst = (keys: string[], value: unknown): boolean => {
+    const key = keys.find((candidate) => schemaProperty(schema, candidate));
+    if (!key) return false;
+    args[key] = value;
+    return true;
+  };
+  assignFirst(["ad_account_id", "account_id"], `act_${adAccountId}`);
+  assignFirst(["entity_type", "entity_level", "level"], "ad");
+  assignFirst(["time_range", "date_range"], { since: date, until: date });
+  assignFirst(["since", "start_date"], date);
+  assignFirst(["until", "end_date"], date);
+  assignFirst(["include_insights", "include_metrics", "with_insights"], true);
+  assignFirst(["limit"], 500);
+  const fields = [
+    "campaign_id", "campaign_name", "adset_id", "adset_name", "ad_id", "ad_name", "objective",
+    "optimization_goal", "spend", "impressions", "reach", "frequency", "ctr", "cpc", "cpm",
+    "actions", "cost_per_action_type", "estimated_ad_recallers", "effective_status", "date_start",
+  ];
+  const fieldsKey = ["fields", "metrics"].find((key) => schemaProperty(schema, key));
+  if (fieldsKey) args[fieldsKey] = schemaProperty(schema, fieldsKey)?.type === "string" ? fields.join(",") : fields;
+  return args;
+}
+
+async function getAdEntitySchema(env: Env, accessToken: string): Promise<Record<string, unknown>> {
+  const cached = await env.CONFIG.get("meta:mcp:ad-entity-schema", "json");
+  if (isRecord(cached)) return cached;
+  const result = await mcpRequest(accessToken, "tools/list");
+  if (!isRecord(result) || !Array.isArray(result.tools)) throw new Error("Meta MCP did not return its tool list");
+  const tool = result.tools.find((item) => isRecord(item) && item.name === "ads_get_ad_entities");
+  if (!isRecord(tool) || !isRecord(tool.inputSchema)) throw new Error("ads_get_ad_entities is unavailable for this account");
+  await env.CONFIG.put("meta:mcp:ad-entity-schema", JSON.stringify(tool.inputSchema), { expirationTtl: 86_400 });
+  return tool.inputSchema;
+}
+
+async function readMcpRows(env: Env, meta: MetaConfig, granularity: "realtime" | "daily"): Promise<FactRow[]> {
+  const date = dateInVietnam();
+  const schema = await getAdEntitySchema(env, meta.accessToken);
+  const result = await mcpToolCall(meta.accessToken, "ads_get_ad_entities", buildAdEntityArgs(schema, meta.adAccountId, date));
+  const unique = new Map<string, FactRow>();
+  for (const insight of extractInsights(result)) {
+    insight.date_start ??= date;
+    const row = insightToFact(insight, granularity);
+    if (row) unique.set(`${row.date}:${row.ad_id}`, row);
+  }
+  return [...unique.values()];
 }
 
 async function upsertSupabase(env: Env, rows: FactRow[]): Promise<void> {
@@ -295,7 +508,7 @@ async function upsertSupabase(env: Env, rows: FactRow[]): Promise<void> {
 async function syncAds(env: Env, granularity: "realtime" | "daily"): Promise<{ count: number }> {
   const meta = await getMetaConfig(env);
   if (!meta || !env.SUPABASE_URL || !env.SUPABASE_SECRET_KEY) throw new Error("Missing Meta or Supabase Worker configuration");
-  const rows = await readMetaRows(env, meta, granularity);
+  const rows = await readMcpRows(env, meta, granularity);
   if (rows.length > 0) await upsertSupabase(env, rows);
   console.log(JSON.stringify({ message: "ads sync complete", granularity, count: rows.length }));
   return { count: rows.length };
@@ -349,37 +562,191 @@ async function unlockMcp(request: Request, env: Env): Promise<Response> {
   return json({ setupToken, expiresIn: 300 });
 }
 
-async function connectMcp(request: Request, env: Env): Promise<Response> {
-  const body = await readSmallJson(request);
-  const setupToken = typeof body?.setupToken === "string" ? body.setupToken : "";
-  const accessToken = typeof body?.accessToken === "string" ? body.accessToken.trim() : "";
-  const rawAccountId = typeof body?.adAccountId === "string" ? body.adAccountId.trim() : "";
-  const adAccountId = rawAccountId.replace(/^act_/, "");
-  if (!/^[0-9]{5,30}$/.test(adAccountId) || accessToken.length < 20 || accessToken.length > 4_096) {
-    return json({ error: "Token hoặc Ad account ID không hợp lệ." }, { status: 400 });
-  }
+function toBase64Url(value: Uint8Array): string {
+  let binary = "";
+  value.forEach((byte) => { binary += String.fromCharCode(byte); });
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
 
+function fromBase64Url(value: string): Uint8Array {
+  const padded = value.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
+  const binary = atob(padded);
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+async function oauthStateKey(env: Env): Promise<CryptoKey> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(env.OAUTH_STATE_SECRET));
+  return crypto.subtle.importKey("raw", digest, "AES-GCM", false, ["encrypt", "decrypt"]);
+}
+
+async function sealOAuthState(env: Env, value: Record<string, unknown>): Promise<string> {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const plaintext = new TextEncoder().encode(JSON.stringify(value));
+  const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await oauthStateKey(env), plaintext);
+  const combined = new Uint8Array(iv.byteLength + encrypted.byteLength);
+  combined.set(iv);
+  combined.set(new Uint8Array(encrypted), iv.byteLength);
+  return toBase64Url(combined);
+}
+
+async function openOAuthState(env: Env, value: string): Promise<Record<string, unknown> | null> {
+  try {
+    const combined = fromBase64Url(value);
+    if (combined.byteLength < 29 || combined.byteLength > 4_096) return null;
+    const iv = combined.slice(0, 12);
+    const ciphertext = combined.slice(12);
+    const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, await oauthStateKey(env), ciphertext);
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(decrypted));
+    return isRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function oauthErrorRedirect(request: Request, message: string): Response {
+  const target = new URL("/", request.url);
+  target.searchParams.set("connect", "mcp");
+  target.searchParams.set("oauth_error", message.slice(0, 180));
+  return Response.redirect(target.toString(), 302);
+}
+
+async function startMcpOAuth(request: Request, env: Env): Promise<Response> {
+  if (!env.META_APP_ID || !env.OAUTH_STATE_SECRET) return json({ error: "MCP OAuth chưa được cấu hình." }, { status: 503 });
+  const url = new URL(request.url);
+  const setupToken = url.searchParams.get("setup_token") ?? "";
   const setupKey = `mcp:setup:${setupToken}`;
   const unlocked = setupToken.length <= 64 ? await env.CONFIG.get(setupKey) : null;
-  if (!unlocked) return json({ error: "Phiên thiết lập đã hết hạn. Hãy mở khóa lại." }, { status: 401 });
+  if (!unlocked) return oauthErrorRedirect(request, "Phiên mở khóa đã hết hạn. Hãy thử lại.");
   await env.CONFIG.delete(setupKey);
 
-  const mcpResponse = await fetch("https://mcp.facebook.com/ads", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      Accept: "application/json, text/event-stream",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ jsonrpc: "2.0", method: "tools/list", id: crypto.randomUUID() }),
+  const codeVerifier = toBase64Url(crypto.getRandomValues(new Uint8Array(48)));
+  const challengeDigest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(codeVerifier));
+  const redirectUri = `${url.origin}/api/oauth/meta/callback`;
+  const metadataResponse = await fetch(MCP_AUTH_METADATA_ENDPOINT, { headers: { Accept: "application/json" } });
+  const metadataText = await readBoundedText(metadataResponse, 32_000);
+  let metadata: unknown = null;
+  try { metadata = JSON.parse(metadataText) as unknown; } catch { /* Handled below. */ }
+  if (!metadataResponse.ok || !isRecord(metadata) || typeof metadata.authorization_endpoint !== "string" || typeof metadata.token_endpoint !== "string") {
+    return oauthErrorRedirect(request, "Không thể đọc cấu hình OAuth từ Ads MCP.");
+  }
+  const state = await sealOAuthState(env, {
+    codeVerifier,
+    redirectUri,
+    tokenEndpoint: metadata.token_endpoint,
+    nonce: crypto.randomUUID(),
+    expiresAt: Date.now() + 10 * 60_000,
   });
-  if (!mcpResponse.ok) {
-    console.error(JSON.stringify({ message: "Meta MCP credential validation failed", status: mcpResponse.status }));
-    return json({ error: "Facebook Ads MCP từ chối token. Hãy kiểm tra quyền và thử lại." }, { status: 400 });
+  const authorizationUrl = new URL(metadata.authorization_endpoint);
+  authorizationUrl.search = new URLSearchParams({
+    client_id: env.META_APP_ID,
+    redirect_uri: redirectUri,
+    response_type: "code",
+    scope: MCP_SCOPES.join(" "),
+    state,
+    code_challenge: toBase64Url(new Uint8Array(challengeDigest)),
+    code_challenge_method: "S256",
+  }).toString();
+  return new Response(null, {
+    status: 302,
+    headers: { Location: authorizationUrl.toString(), "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
+  });
+}
+
+async function finishMcpOAuth(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const oauthError = url.searchParams.get("error_description") ?? url.searchParams.get("error");
+  if (oauthError) return oauthErrorRedirect(request, oauthError);
+  const code = url.searchParams.get("code") ?? "";
+  const state = await openOAuthState(env, url.searchParams.get("state") ?? "");
+  const codeVerifier = typeof state?.codeVerifier === "string" ? state.codeVerifier : "";
+  const redirectUri = typeof state?.redirectUri === "string" ? state.redirectUri : "";
+  const tokenEndpoint = typeof state?.tokenEndpoint === "string" ? state.tokenEndpoint : "";
+  const expiresAt = typeof state?.expiresAt === "number" ? state.expiresAt : 0;
+  const tokenUrl = tokenEndpoint ? new URL(tokenEndpoint) : null;
+  if (!code || !codeVerifier || redirectUri !== `${url.origin}/api/oauth/meta/callback` || expiresAt < Date.now() || tokenUrl?.protocol !== "https:" || !tokenUrl.hostname.endsWith("facebook.com")) {
+    return oauthErrorRedirect(request, "Phiên OAuth không hợp lệ hoặc đã hết hạn.");
   }
 
-  const stored: StoredMetaConfig = { accessToken, adAccountId, connectedAt: new Date().toISOString() };
-  await env.CONFIG.put("meta:mcp", JSON.stringify(stored));
+  const tokenResponse = await fetch(tokenUrl.toString(), {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      client_id: env.META_APP_ID,
+      code,
+      redirect_uri: redirectUri,
+      code_verifier: codeVerifier,
+    }),
+  });
+  const tokenText = await readBoundedText(tokenResponse, 64_000);
+  let tokenPayload: unknown = null;
+  try { tokenPayload = JSON.parse(tokenText) as unknown; } catch { /* Handled below. */ }
+  if (!tokenResponse.ok || !isRecord(tokenPayload) || typeof tokenPayload.access_token !== "string") {
+    console.error(JSON.stringify({ message: "MCP OAuth token exchange failed", status: tokenResponse.status }));
+    return oauthErrorRedirect(request, "Facebook không thể cấp quyền MCP. Hãy kiểm tra cấu hình ứng dụng.");
+  }
+
+  const accessToken = tokenPayload.access_token;
+  const accountResult = await mcpToolCall(accessToken, "ads_get_ad_accounts", {});
+  const accounts = extractAccounts(accountResult);
+  if (accounts.length === 0) return oauthErrorRedirect(request, "Ads MCP chưa trả về tài khoản quảng cáo nào cho người dùng này.");
+  const resultId = crypto.randomUUID();
+  const selection: OAuthSelection = {
+    accessToken,
+    refreshToken: typeof tokenPayload.refresh_token === "string" ? tokenPayload.refresh_token : undefined,
+    expiresAt: typeof tokenPayload.expires_in === "number" ? Date.now() + tokenPayload.expires_in * 1_000 : undefined,
+    accounts,
+  };
+  const sealedSelection = await sealOAuthState(env, {
+    accessToken: selection.accessToken,
+    refreshToken: selection.refreshToken,
+    expiresAt: selection.expiresAt,
+  });
+  await env.CONFIG.put(`mcp:oauth-result:${resultId}`, JSON.stringify({ sealed: sealedSelection, accounts }), { expirationTtl: 600 });
+  const target = new URL("/", request.url);
+  target.searchParams.set("connect", "mcp");
+  target.searchParams.set("oauth_result", resultId);
+  return Response.redirect(target.toString(), 302);
+}
+
+async function getMcpOAuthResult(request: Request, env: Env): Promise<Response> {
+  const id = new URL(request.url).searchParams.get("id") ?? "";
+  const selection = id.length <= 64 ? await env.CONFIG.get(`mcp:oauth-result:${id}`, "json") : null;
+  if (!isRecord(selection) || !Array.isArray(selection.accounts)) {
+    return json({ error: "Kết quả OAuth đã hết hạn. Hãy đăng nhập lại." }, { status: 404 });
+  }
+  return json({ accounts: extractAccounts(selection.accounts) });
+}
+
+async function completeMcpOAuth(request: Request, env: Env): Promise<Response> {
+  const body = await readSmallJson(request);
+  const resultId = typeof body?.resultId === "string" ? body.resultId : "";
+  const rawAccountId = typeof body?.adAccountId === "string" ? body.adAccountId.trim() : "";
+  const adAccountId = rawAccountId.replace(/^act_/, "");
+  if (!/^[0-9]{5,30}$/.test(adAccountId) || resultId.length > 64) return json({ error: "Tài khoản quảng cáo không hợp lệ." }, { status: 400 });
+  const selection = await env.CONFIG.get(`mcp:oauth-result:${resultId}`, "json");
+  if (!isRecord(selection) || typeof selection.sealed !== "string" || !Array.isArray(selection.accounts)) {
+    return json({ error: "Phiên chọn tài khoản đã hết hạn. Hãy đăng nhập lại." }, { status: 401 });
+  }
+  if (!extractAccounts(selection.accounts).some((account) => account.id === adAccountId)) {
+    return json({ error: "Tài khoản không thuộc phiên MCP này." }, { status: 403 });
+  }
+  const decrypted = await openOAuthState(env, selection.sealed);
+  if (!isRecord(decrypted) || typeof decrypted.accessToken !== "string") {
+    return json({ error: "Phiên MCP không hợp lệ. Hãy đăng nhập lại." }, { status: 401 });
+  }
+  const stored: StoredMetaConfig = {
+    accessToken: decrypted.accessToken,
+    adAccountId,
+    refreshToken: typeof decrypted.refreshToken === "string" ? decrypted.refreshToken : undefined,
+    expiresAt: typeof decrypted.expiresAt === "number" ? decrypted.expiresAt : undefined,
+    connectedAt: new Date().toISOString(),
+  };
+  const sealedConfig = await sealOAuthState(env, stored);
+  await Promise.all([
+    env.CONFIG.put("meta:mcp", JSON.stringify({ sealed: sealedConfig, adAccountId, connectedAt: stored.connectedAt })),
+    env.CONFIG.delete(`mcp:oauth-result:${resultId}`),
+  ]);
   return json({ connected: true, adAccountId: `act_${adAccountId}`, connectedAt: stored.connectedAt });
 }
 
@@ -389,7 +756,10 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   if (url.pathname === "/api/config") return json({ url: env.SUPABASE_URL, publishableKey: env.SUPABASE_PUBLISHABLE_KEY });
   if (url.pathname === "/api/mcp/status" && request.method === "GET") return json({ connected: Boolean(await getMetaConfig(env)) });
   if (url.pathname === "/api/mcp/unlock" && request.method === "POST") return unlockMcp(request, env);
-  if (url.pathname === "/api/mcp/connect" && request.method === "POST") return connectMcp(request, env);
+  if (url.pathname === "/api/oauth/meta/start" && request.method === "GET") return startMcpOAuth(request, env);
+  if (url.pathname === "/api/oauth/meta/callback" && request.method === "GET") return finishMcpOAuth(request, env);
+  if (url.pathname === "/api/oauth/meta/result" && request.method === "GET") return getMcpOAuthResult(request, env);
+  if (url.pathname === "/api/oauth/meta/complete" && request.method === "POST") return completeMcpOAuth(request, env);
   if (url.pathname === "/api/dashboard" && request.method === "GET") return fetchDashboard(request, env);
   if (url.pathname === "/api/sync" && request.method === "POST") {
     const authorized = await constantTimeEqual(request.headers.get("Authorization") ?? "", `Bearer ${env.SYNC_SECRET}`);

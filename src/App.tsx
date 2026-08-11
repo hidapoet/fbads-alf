@@ -59,6 +59,8 @@ const GROUP_LABEL: Record<ResultGroup, string> = {
 const money = new Intl.NumberFormat("vi-VN", { style: "currency", currency: "VND", maximumFractionDigits: 0 });
 const number = new Intl.NumberFormat("vi-VN", { maximumFractionDigits: 1 });
 
+type McpAdAccount = { id: string; name: string; currency?: string; status?: string; timezone?: string };
+
 function defaultRange() {
   const to = new Date();
   const from = new Date(to.getTime() - 6 * 86_400_000);
@@ -97,10 +99,10 @@ function Dashboard({ dark, onThemeChange }: { dark: boolean; onThemeChange: () =
   const [sortBy, setSortBy] = useState<"spend" | "cost">("spend");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [connectOpen, setConnectOpen] = useState(() => new URLSearchParams(window.location.search).get("connect") === "mcp");
-  const [connectStep, setConnectStep] = useState<"password" | "credentials">("password");
+  const [connectStep, setConnectStep] = useState<"password" | "accounts">(() => new URLSearchParams(window.location.search).has("oauth_result") ? "accounts" : "password");
   const [connectPassword, setConnectPassword] = useState("");
-  const [setupToken, setSetupToken] = useState("");
-  const [metaToken, setMetaToken] = useState("");
+  const [oauthResultId, setOauthResultId] = useState(() => new URLSearchParams(window.location.search).get("oauth_result") ?? "");
+  const [mcpAccounts, setMcpAccounts] = useState<McpAdAccount[]>([]);
   const [adAccountId, setAdAccountId] = useState("");
   const [connectBusy, setConnectBusy] = useState(false);
   const [connectError, setConnectError] = useState<string | null>(null);
@@ -124,6 +126,35 @@ function Dashboard({ dark, onThemeChange }: { dark: boolean; onThemeChange: () =
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const oauthError = params.get("oauth_error");
+    const resultId = params.get("oauth_result");
+    if (oauthError) {
+      setConnectOpen(true);
+      setConnectError(oauthError);
+      return;
+    }
+    if (!resultId) return;
+    setConnectOpen(true);
+    setConnectStep("accounts");
+    setConnectBusy(true);
+    void (async () => {
+      try {
+        const result = await fetch(`/api/oauth/meta/result?id=${encodeURIComponent(resultId)}`);
+        const payload = await result.json() as { accounts?: McpAdAccount[]; error?: string };
+        if (!result.ok || !payload.accounts?.length) throw new Error(payload.error ?? "MCP không trả về tài khoản quảng cáo.");
+        setMcpAccounts(payload.accounts);
+        setAdAccountId(payload.accounts[0].id);
+        setOauthResultId(resultId);
+      } catch (cause) {
+        setConnectError(cause instanceof Error ? cause.message : "Không thể đọc tài khoản từ MCP.");
+      } finally {
+        setConnectBusy(false);
+      }
+    })();
+  }, []);
 
   useEffect(() => {
     const openWithShortcut = (event: KeyboardEvent) => {
@@ -185,10 +216,11 @@ function Dashboard({ dark, onThemeChange }: { dark: boolean; onThemeChange: () =
   function resetConnectionDialog() {
     setConnectStep("password");
     setConnectPassword("");
-    setSetupToken("");
-    setMetaToken("");
+    setOauthResultId("");
+    setMcpAccounts([]);
     setAdAccountId("");
     setConnectError(null);
+    window.history.replaceState({}, "", window.location.pathname);
   }
 
   async function unlockConnection() {
@@ -202,9 +234,8 @@ function Dashboard({ dark, onThemeChange }: { dark: boolean; onThemeChange: () =
       });
       const payload = await result.json() as { setupToken?: string; error?: string };
       if (!result.ok || !payload.setupToken) throw new Error(payload.error ?? "Mật khẩu không đúng.");
-      setSetupToken(payload.setupToken);
       setConnectPassword("");
-      setConnectStep("credentials");
+      window.location.assign(`/api/oauth/meta/start?setup_token=${encodeURIComponent(payload.setupToken)}`);
     } catch (cause) {
       setConnectError(cause instanceof Error ? cause.message : "Không thể mở khóa kết nối.");
     } finally {
@@ -212,14 +243,14 @@ function Dashboard({ dark, onThemeChange }: { dark: boolean; onThemeChange: () =
     }
   }
 
-  async function connectMcp() {
+  async function completeMcpConnection() {
     setConnectBusy(true);
     setConnectError(null);
     try {
-      const result = await fetch("/api/mcp/connect", {
+      const result = await fetch("/api/oauth/meta/complete", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ setupToken, accessToken: metaToken.trim(), adAccountId: adAccountId.trim() }),
+        body: JSON.stringify({ resultId: oauthResultId, adAccountId }),
       });
       const payload = await result.json() as { error?: string };
       if (!result.ok) throw new Error(payload.error ?? "Không thể kết nối Facebook Ads MCP.");
@@ -374,11 +405,11 @@ function Dashboard({ dark, onThemeChange }: { dark: boolean; onThemeChange: () =
       }}>
         <DialogSurface className="connect-dialog">
           <DialogBody>
-            <DialogTitle>{connectStep === "password" ? "Mở khóa kết nối MCP" : "Kết nối Facebook Ads MCP"}</DialogTitle>
+            <DialogTitle>{connectStep === "password" ? "Đăng nhập Facebook Ads MCP" : "Chọn tài khoản quảng cáo"}</DialogTitle>
             <DialogContent className="connect-dialog-content">
               {connectStep === "password" ? (
                 <>
-                  <p>Nhập mật khẩu quản trị để tiếp tục. Mật khẩu được kiểm tra an toàn ở Cloudflare Worker.</p>
+                  <p>Nhập mật khẩu quản trị, sau đó web sẽ chuyển thẳng sang Facebook để cấp quyền cho Ads MCP.</p>
                   <Field label="Mật khẩu" required>
                     <Input type="password" autoFocus value={connectPassword} onChange={(_, data) => setConnectPassword(data.value)} onKeyDown={(event) => {
                       if (event.key === "Enter" && connectPassword) void unlockConnection();
@@ -387,12 +418,20 @@ function Dashboard({ dark, onThemeChange }: { dark: boolean; onThemeChange: () =
                 </>
               ) : (
                 <>
-                  <p>Nhập token Meta có quyền đọc quảng cáo và ID tài khoản quảng cáo cần theo dõi.</p>
-                  <Field label="Meta access token" required>
-                    <Input type="password" autoFocus value={metaToken} onChange={(_, data) => setMetaToken(data.value)} placeholder="EAA…" />
-                  </Field>
-                  <Field label="Ad account ID" hint="Chỉ nhập dãy số, không cần tiền tố act_" required>
-                    <Input value={adAccountId} onChange={(_, data) => setAdAccountId(data.value)} placeholder="1234567890" />
+                  <p>Danh sách này được lấy trực tiếp bằng MCP tool <code>ads_get_ad_accounts</code>. Chọn tài khoản cần theo dõi.</p>
+                  <Field label="Tài khoản quảng cáo" required>
+                    <Dropdown
+                      value={mcpAccounts.find((account) => account.id === adAccountId)?.name ?? "Đang tải tài khoản…"}
+                      selectedOptions={adAccountId ? [adAccountId] : []}
+                      onOptionSelect={(_, data) => setAdAccountId(data.optionValue ?? "")}
+                      disabled={connectBusy || mcpAccounts.length === 0}
+                    >
+                      {mcpAccounts.map((account) => (
+                        <Option key={account.id} value={account.id} text={`${account.name} · act_${account.id}`}>
+                          {account.name} · act_{account.id}{account.currency ? ` · ${account.currency}` : ""}
+                        </Option>
+                      ))}
+                    </Dropdown>
                   </Field>
                 </>
               )}
@@ -405,15 +444,15 @@ function Dashboard({ dark, onThemeChange }: { dark: boolean; onThemeChange: () =
                   {connectBusy ? <Spinner size="tiny" /> : "Tiếp tục"}
                 </Button>
               ) : (
-                <Button appearance="primary" onClick={() => void connectMcp()} disabled={connectBusy || !metaToken.trim() || !adAccountId.trim()}>
-                  {connectBusy ? <Spinner size="tiny" /> : "Kết nối"}
+                <Button appearance="primary" onClick={() => void completeMcpConnection()} disabled={connectBusy || !oauthResultId || !adAccountId}>
+                  {connectBusy ? <Spinner size="tiny" /> : "Theo dõi tài khoản này"}
                 </Button>
               )}
             </DialogActions>
           </DialogBody>
         </DialogSurface>
       </Dialog>
-      <footer>ALF Ads Monitor. Nguồn dữ liệu: Meta Marketing API, Cloudflare Workers và Supabase.</footer>
+      <footer>ALF Ads Monitor. Nguồn dữ liệu: Meta Ads MCP, Cloudflare Workers và Supabase.</footer>
     </main>
   );
 }
