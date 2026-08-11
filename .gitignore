@@ -12,6 +12,7 @@ node_modules/
 dist/
 worker-configuration.d.ts
 dashboard-*.png
+.chrome-check*/
 *-local.*.log
 .npm-cache/
 *.tsbuildinfo

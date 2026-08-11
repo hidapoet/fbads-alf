@@ -32,6 +32,15 @@ type MetaPage = {
   error?: { message?: string };
 };
 
+type MetaConfig = {
+  accessToken: string;
+  adAccountId: string;
+};
+
+type StoredMetaConfig = MetaConfig & {
+  connectedAt: string;
+};
+
 const jsonHeaders = {
   "Content-Type": "application/json; charset=utf-8",
   "Cache-Control": "no-store",
@@ -88,10 +97,21 @@ function dateInVietnam(offsetDays = 0): string {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Ho_Chi_Minh", year: "numeric", month: "2-digit", day: "2-digit" }).format(value);
 }
 
-function envReady(env: Env): { supabase: boolean; meta: boolean } {
+async function getMetaConfig(env: Env): Promise<MetaConfig | null> {
+  const stored = await env.CONFIG.get("meta:mcp", "json");
+  if (isRecord(stored) && typeof stored.accessToken === "string" && typeof stored.adAccountId === "string") {
+    return { accessToken: stored.accessToken, adAccountId: stored.adAccountId };
+  }
+  if (env.META_ACCESS_TOKEN && env.META_AD_ACCOUNT_ID) {
+    return { accessToken: env.META_ACCESS_TOKEN, adAccountId: env.META_AD_ACCOUNT_ID };
+  }
+  return null;
+}
+
+async function envReady(env: Env): Promise<{ supabase: boolean; meta: boolean }> {
   return {
     supabase: Boolean(env.SUPABASE_URL && env.SUPABASE_SECRET_KEY),
-    meta: Boolean(env.META_ACCESS_TOKEN && env.META_AD_ACCOUNT_ID),
+    meta: Boolean(await getMetaConfig(env)),
   };
 }
 
@@ -101,7 +121,7 @@ async function fetchDashboard(request: Request, env: Env): Promise<Response> {
   const from = url.searchParams.get("from") ?? dateInVietnam(-6);
   const to = url.searchParams.get("to") ?? dateInVietnam();
   const granularity = period === "realtime" ? "realtime" : "daily";
-  const connection = envReady(env);
+  const connection = await envReady(env);
 
   if (connection.supabase) {
     const params = new URLSearchParams({
@@ -222,7 +242,7 @@ function insightToFact(insight: MetaInsight, granularity: "realtime" | "daily"):
   };
 }
 
-async function readMetaRows(env: Env, granularity: "realtime" | "daily"): Promise<FactRow[]> {
+async function readMetaRows(env: Env, meta: MetaConfig, granularity: "realtime" | "daily"): Promise<FactRow[]> {
   const date = dateInVietnam();
   const fields = [
     "date_start", "campaign_id", "campaign_name", "adset_id", "adset_name", "ad_id", "ad_name",
@@ -230,14 +250,14 @@ async function readMetaRows(env: Env, granularity: "realtime" | "daily"): Promis
     "actions", "cost_per_action_type", "estimated_ad_recallers", "effective_status",
   ].join(",");
   const params = new URLSearchParams({
-    access_token: env.META_ACCESS_TOKEN,
+    access_token: meta.accessToken,
     level: "ad",
     fields,
     time_range: JSON.stringify({ since: date, until: date }),
     time_increment: "1",
     limit: "500",
   });
-  let next: string | undefined = `https://graph.facebook.com/${env.META_API_VERSION}/act_${env.META_AD_ACCOUNT_ID}/insights?${params}`;
+  let next: string | undefined = `https://graph.facebook.com/${env.META_API_VERSION}/act_${meta.adAccountId}/insights?${params}`;
   const rows: FactRow[] = [];
   let pages = 0;
   while (next && pages < 50) {
@@ -273,9 +293,9 @@ async function upsertSupabase(env: Env, rows: FactRow[]): Promise<void> {
 }
 
 async function syncAds(env: Env, granularity: "realtime" | "daily"): Promise<{ count: number }> {
-  const connection = envReady(env);
-  if (!connection.meta || !connection.supabase) throw new Error("Missing Meta or Supabase Worker secrets");
-  const rows = await readMetaRows(env, granularity);
+  const meta = await getMetaConfig(env);
+  if (!meta || !env.SUPABASE_URL || !env.SUPABASE_SECRET_KEY) throw new Error("Missing Meta or Supabase Worker configuration");
+  const rows = await readMetaRows(env, meta, granularity);
   if (rows.length > 0) await upsertSupabase(env, rows);
   console.log(JSON.stringify({ message: "ads sync complete", granularity, count: rows.length }));
   return { count: rows.length };
@@ -294,10 +314,82 @@ async function constantTimeEqual(provided: string, expected: string): Promise<bo
   return difference === 0;
 }
 
+async function readSmallJson(request: Request): Promise<Record<string, unknown> | null> {
+  const contentLength = Number(request.headers.get("Content-Length") ?? "0");
+  if (contentLength > 8_192) return null;
+  const value: unknown = await request.json();
+  return isRecord(value) ? value : null;
+}
+
+async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function unlockMcp(request: Request, env: Env): Promise<Response> {
+  if (!env.CONNECT_PASSWORD) return json({ error: "Kết nối MCP chưa được cấu hình." }, { status: 503 });
+  const ipHash = await sha256Hex(request.headers.get("CF-Connecting-IP") ?? "unknown");
+  const attemptsKey = `mcp:attempts:${ipHash}`;
+  const attempts = toNumber(await env.CONFIG.get(attemptsKey));
+  if (attempts >= 5) return json({ error: "Đã thử quá nhiều lần. Vui lòng thử lại sau 10 phút." }, { status: 429 });
+
+  const body = await readSmallJson(request);
+  const password = typeof body?.password === "string" ? body.password : "";
+  const authorized = await constantTimeEqual(password, env.CONNECT_PASSWORD);
+  if (!authorized) {
+    await env.CONFIG.put(attemptsKey, String(attempts + 1), { expirationTtl: 600 });
+    return json({ error: "Mật khẩu không đúng." }, { status: 401 });
+  }
+
+  const setupToken = crypto.randomUUID();
+  await Promise.all([
+    env.CONFIG.put(`mcp:setup:${setupToken}`, "1", { expirationTtl: 300 }),
+    env.CONFIG.delete(attemptsKey),
+  ]);
+  return json({ setupToken, expiresIn: 300 });
+}
+
+async function connectMcp(request: Request, env: Env): Promise<Response> {
+  const body = await readSmallJson(request);
+  const setupToken = typeof body?.setupToken === "string" ? body.setupToken : "";
+  const accessToken = typeof body?.accessToken === "string" ? body.accessToken.trim() : "";
+  const rawAccountId = typeof body?.adAccountId === "string" ? body.adAccountId.trim() : "";
+  const adAccountId = rawAccountId.replace(/^act_/, "");
+  if (!/^[0-9]{5,30}$/.test(adAccountId) || accessToken.length < 20 || accessToken.length > 4_096) {
+    return json({ error: "Token hoặc Ad account ID không hợp lệ." }, { status: 400 });
+  }
+
+  const setupKey = `mcp:setup:${setupToken}`;
+  const unlocked = setupToken.length <= 64 ? await env.CONFIG.get(setupKey) : null;
+  if (!unlocked) return json({ error: "Phiên thiết lập đã hết hạn. Hãy mở khóa lại." }, { status: 401 });
+  await env.CONFIG.delete(setupKey);
+
+  const mcpResponse = await fetch("https://mcp.facebook.com/ads", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: "application/json, text/event-stream",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ jsonrpc: "2.0", method: "tools/list", id: crypto.randomUUID() }),
+  });
+  if (!mcpResponse.ok) {
+    console.error(JSON.stringify({ message: "Meta MCP credential validation failed", status: mcpResponse.status }));
+    return json({ error: "Facebook Ads MCP từ chối token. Hãy kiểm tra quyền và thử lại." }, { status: 400 });
+  }
+
+  const stored: StoredMetaConfig = { accessToken, adAccountId, connectedAt: new Date().toISOString() };
+  await env.CONFIG.put("meta:mcp", JSON.stringify(stored));
+  return json({ connected: true, adAccountId: `act_${adAccountId}`, connectedAt: stored.connectedAt });
+}
+
 async function handleApi(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
-  if (url.pathname === "/api/health") return json({ ok: true, connection: envReady(env), time: new Date().toISOString() });
+  if (url.pathname === "/api/health") return json({ ok: true, connection: await envReady(env), time: new Date().toISOString() });
   if (url.pathname === "/api/config") return json({ url: env.SUPABASE_URL, publishableKey: env.SUPABASE_PUBLISHABLE_KEY });
+  if (url.pathname === "/api/mcp/status" && request.method === "GET") return json({ connected: Boolean(await getMetaConfig(env)) });
+  if (url.pathname === "/api/mcp/unlock" && request.method === "POST") return unlockMcp(request, env);
+  if (url.pathname === "/api/mcp/connect" && request.method === "POST") return connectMcp(request, env);
   if (url.pathname === "/api/dashboard" && request.method === "GET") return fetchDashboard(request, env);
   if (url.pathname === "/api/sync" && request.method === "POST") {
     const authorized = await constantTimeEqual(request.headers.get("Authorization") ?? "", `Bearer ${env.SYNC_SECRET}`);

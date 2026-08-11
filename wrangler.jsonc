@@ -8,6 +8,12 @@
     "not_found_handling": "single-page-application",
     "run_worker_first": ["/api/*"]
   },
+  "kv_namespaces": [
+    {
+      "binding": "CONFIG",
+      "id": "35cc3d04a5504dbfbb61ec5b7fe3a0c1"
+    }
+  ],
   "vars": {
     "SUPABASE_URL": "https://aixjkcqupoysdiqcopke.supabase.co",
     "SUPABASE_PUBLISHABLE_KEY": "sb_publishable_qNMn7TMVQbbbr4Tema8mvA_CsrXEWQO",

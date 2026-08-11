@@ -1,7 +1,14 @@
 import {
   Badge,
   Button,
+  Dialog,
+  DialogActions,
+  DialogBody,
+  DialogContent,
+  DialogSurface,
+  DialogTitle,
   Dropdown,
+  Field,
   FluentProvider,
   Input,
   MessageBar,
@@ -10,6 +17,7 @@ import {
   Option,
   Skeleton,
   SkeletonItem,
+  Spinner,
   Tab,
   TabList,
   webDarkTheme,
@@ -88,6 +96,14 @@ function Dashboard({ dark, onThemeChange }: { dark: boolean; onThemeChange: () =
   const [group, setGroup] = useState("ALL");
   const [sortBy, setSortBy] = useState<"spend" | "cost">("spend");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [connectOpen, setConnectOpen] = useState(false);
+  const [connectStep, setConnectStep] = useState<"password" | "credentials">("password");
+  const [connectPassword, setConnectPassword] = useState("");
+  const [setupToken, setSetupToken] = useState("");
+  const [metaToken, setMetaToken] = useState("");
+  const [adAccountId, setAdAccountId] = useState("");
+  const [connectBusy, setConnectBusy] = useState(false);
+  const [connectError, setConnectError] = useState<string | null>(null);
 
   const load = useCallback(async (quiet = false) => {
     if (!quiet) setLoading(true);
@@ -108,6 +124,19 @@ function Dashboard({ dark, onThemeChange }: { dark: boolean; onThemeChange: () =
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    const openWithShortcut = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const isEditing = target?.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target?.tagName ?? "");
+      if (event.key.toLocaleLowerCase() === "i" && !event.ctrlKey && !event.metaKey && !event.altKey && !isEditing) {
+        event.preventDefault();
+        setConnectOpen(true);
+      }
+    };
+    window.addEventListener("keydown", openWithShortcut);
+    return () => window.removeEventListener("keydown", openWithShortcut);
+  }, []);
 
   useEffect(() => {
     if (period !== "realtime" || response?.source !== "supabase") return;
@@ -153,6 +182,57 @@ function Dashboard({ dark, onThemeChange }: { dark: boolean; onThemeChange: () =
     });
   }
 
+  function resetConnectionDialog() {
+    setConnectStep("password");
+    setConnectPassword("");
+    setSetupToken("");
+    setMetaToken("");
+    setAdAccountId("");
+    setConnectError(null);
+  }
+
+  async function unlockConnection() {
+    setConnectBusy(true);
+    setConnectError(null);
+    try {
+      const result = await fetch("/api/mcp/unlock", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: connectPassword }),
+      });
+      const payload = await result.json() as { setupToken?: string; error?: string };
+      if (!result.ok || !payload.setupToken) throw new Error(payload.error ?? "Mật khẩu không đúng.");
+      setSetupToken(payload.setupToken);
+      setConnectPassword("");
+      setConnectStep("credentials");
+    } catch (cause) {
+      setConnectError(cause instanceof Error ? cause.message : "Không thể mở khóa kết nối.");
+    } finally {
+      setConnectBusy(false);
+    }
+  }
+
+  async function connectMcp() {
+    setConnectBusy(true);
+    setConnectError(null);
+    try {
+      const result = await fetch("/api/mcp/connect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ setupToken, accessToken: metaToken.trim(), adAccountId: adAccountId.trim() }),
+      });
+      const payload = await result.json() as { error?: string };
+      if (!result.ok) throw new Error(payload.error ?? "Không thể kết nối Facebook Ads MCP.");
+      setConnectOpen(false);
+      resetConnectionDialog();
+      await load();
+    } catch (cause) {
+      setConnectError(cause instanceof Error ? cause.message : "Không thể kết nối Facebook Ads MCP.");
+    } finally {
+      setConnectBusy(false);
+    }
+  }
+
   return (
     <main className="shell">
       <header className="topbar">
@@ -167,6 +247,9 @@ function Dashboard({ dark, onThemeChange }: { dark: boolean; onThemeChange: () =
           <Badge appearance="tint" color={response?.source === "supabase" ? "success" : "warning"}>
             {response?.source === "supabase" ? "Dữ liệu thật" : "Dữ liệu minh họa"}
           </Badge>
+          <Button appearance="subtle" className="connect-shortcut" onClick={() => setConnectOpen(true)} aria-label="Kết nối Facebook Ads MCP">
+            <kbd>i</kbd><span>Kết nối MCP</span>
+          </Button>
           <Button appearance="subtle" onClick={onThemeChange} aria-label="Đổi giao diện sáng tối">{dark ? "Sáng" : "Tối"}</Button>
           <Button appearance="primary" onClick={() => void load()} disabled={loading}>
             Làm mới
@@ -220,10 +303,11 @@ function Dashboard({ dark, onThemeChange }: { dark: boolean; onThemeChange: () =
         <>
           <section className="kpi-grid" aria-label="Chỉ số tổng quan">
             <Metric label="Chi tiêu" value={money.format(totals.spend)} hint={`${number.format(filteredRows.length)} bản ghi`} accent />
-            <Metric label="CTR liên kết" value={`${number.format(totals.ctr)}%`} hint={`${number.format(totals.clicks)} click`} />
-            <Metric label="CPC liên kết" value={money.format(totals.cpc)} hint="Chi phí mỗi click" />
-            <Metric label="CPM" value={money.format(totals.cpm)} hint={`${number.format(totals.impressions)} lượt hiển thị`} />
-            <Metric label="Tiếp cận" value={number.format(totals.reach)} hint={`Tần suất ${number.format(totals.frequency)}`} />
+            <Metric label="CTR" value={`${number.format(totals.ctr)}%`} hint={`${number.format(totals.clicks)} click liên kết`} />
+            <Metric label="CPC (link click)" value={money.format(totals.cpc)} hint="Chi phí mỗi click liên kết" />
+            <Metric label="Impressions" value={number.format(totals.impressions)} hint="Lượt hiển thị" />
+            <Metric label="Reach" value={number.format(totals.reach)} hint="Người tiếp cận" />
+            <Metric label="Tần suất" value={number.format(totals.frequency)} hint="Số lần hiển thị trung bình" />
           </section>
 
           <section className="analysis-grid">
@@ -284,6 +368,51 @@ function Dashboard({ dark, onThemeChange }: { dark: boolean; onThemeChange: () =
           </section>
         </>
       )}
+      <Dialog open={connectOpen} onOpenChange={(_, data) => {
+        setConnectOpen(data.open);
+        if (!data.open) resetConnectionDialog();
+      }}>
+        <DialogSurface className="connect-dialog">
+          <DialogBody>
+            <DialogTitle>{connectStep === "password" ? "Mở khóa kết nối MCP" : "Kết nối Facebook Ads MCP"}</DialogTitle>
+            <DialogContent className="connect-dialog-content">
+              {connectStep === "password" ? (
+                <>
+                  <p>Nhập mật khẩu quản trị để tiếp tục. Mật khẩu được kiểm tra an toàn ở Cloudflare Worker.</p>
+                  <Field label="Mật khẩu" required>
+                    <Input type="password" autoFocus value={connectPassword} onChange={(_, data) => setConnectPassword(data.value)} onKeyDown={(event) => {
+                      if (event.key === "Enter" && connectPassword) void unlockConnection();
+                    }} />
+                  </Field>
+                </>
+              ) : (
+                <>
+                  <p>Nhập token Meta có quyền đọc quảng cáo và ID tài khoản quảng cáo cần theo dõi.</p>
+                  <Field label="Meta access token" required>
+                    <Input type="password" autoFocus value={metaToken} onChange={(_, data) => setMetaToken(data.value)} placeholder="EAA…" />
+                  </Field>
+                  <Field label="Ad account ID" hint="Chỉ nhập dãy số, không cần tiền tố act_" required>
+                    <Input value={adAccountId} onChange={(_, data) => setAdAccountId(data.value)} placeholder="1234567890" />
+                  </Field>
+                </>
+              )}
+              {connectError && <MessageBar intent="error"><MessageBarBody>{connectError}</MessageBarBody></MessageBar>}
+            </DialogContent>
+            <DialogActions>
+              <Button appearance="secondary" onClick={() => setConnectOpen(false)} disabled={connectBusy}>Hủy</Button>
+              {connectStep === "password" ? (
+                <Button appearance="primary" onClick={() => void unlockConnection()} disabled={connectBusy || !connectPassword}>
+                  {connectBusy ? <Spinner size="tiny" /> : "Tiếp tục"}
+                </Button>
+              ) : (
+                <Button appearance="primary" onClick={() => void connectMcp()} disabled={connectBusy || !metaToken.trim() || !adAccountId.trim()}>
+                  {connectBusy ? <Spinner size="tiny" /> : "Kết nối"}
+                </Button>
+              )}
+            </DialogActions>
+          </DialogBody>
+        </DialogSurface>
+      </Dialog>
       <footer>ALF Ads Monitor. Nguồn dữ liệu: Meta Marketing API, Cloudflare Workers và Supabase.</footer>
     </main>
   );
@@ -316,7 +445,7 @@ function renderTreeRows(node: TreeNode, expanded: Set<string>, toggle: (id: stri
 }
 
 function LoadingDashboard() {
-  return <div className="loading-layout" aria-label="Đang tải dữ liệu"><Skeleton><div className="skeleton-grid">{Array.from({ length: 5 }, (_, index) => <SkeletonItem key={index} className="skeleton-card" />)}</div><SkeletonItem className="skeleton-panel" /></Skeleton></div>;
+  return <div className="loading-layout" aria-label="Đang tải dữ liệu"><Skeleton><div className="skeleton-grid">{Array.from({ length: 6 }, (_, index) => <SkeletonItem key={index} className="skeleton-card" />)}</div><SkeletonItem className="skeleton-panel" /></Skeleton></div>;
 }
 
 function EmptyState({ text }: { text: string }) {

@@ -99,6 +99,18 @@ button, input { font: inherit; }
 .product-context { color: var(--text-muted); font-size: 12px; margin-top: 1px; }
 .header-actions { gap: 8px; }
 
+.connect-shortcut kbd {
+  min-width: 21px;
+  height: 21px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-strong);
+  font: 650 12px/1 inherit;
+  text-transform: uppercase;
+}
+
 .page-heading {
   display: flex;
   justify-content: space-between;
@@ -167,9 +179,23 @@ button, input { font: inherit; }
 
 .kpi-grid {
   display: grid;
-  grid-template-columns: 1.25fr repeat(4, 1fr);
+  grid-template-columns: 1.25fr repeat(5, 1fr);
   gap: 10px;
   margin-top: 18px;
+}
+
+.connect-dialog { max-width: 470px; }
+
+.connect-dialog-content {
+  display: grid;
+  gap: 16px;
+  padding-top: 5px;
+}
+
+.connect-dialog-content p {
+  margin: 0;
+  color: var(--text-muted);
+  line-height: 1.5;
 }
 
 .metric {
@@ -325,7 +351,7 @@ tbody tr:hover { background: var(--surface-strong); }
 }
 
 .loading-layout { margin-top: 18px; }
-.skeleton-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }
+.skeleton-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px; }
 .skeleton-card { height: 132px; border-radius: var(--radius); }
 .skeleton-panel { height: 420px; margin-top: 14px; border-radius: var(--radius); }
 
