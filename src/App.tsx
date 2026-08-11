@@ -301,8 +301,8 @@ function Dashboard({ dark, onThemeChange }: { dark: boolean; onThemeChange: () =
           </div>
         </div>
         <div className="header-actions">
-          <Badge appearance="tint" color={response?.source && response.source !== "demo" ? "success" : "warning"}>
-            {response?.source === "mcp" ? "MCP trực tiếp" : response?.source === "supabase" ? "Dữ liệu thật" : "Dữ liệu minh họa"}
+          <Badge appearance="tint" color={response?.source === "mcp" || response?.source === "supabase" ? "success" : "warning"}>
+            {response?.source === "mcp" ? "MCP trực tiếp" : response?.source === "supabase" ? "Dữ liệu thật" : response?.source === "unavailable" ? "MCP chưa khả dụng" : "Dữ liệu minh họa"}
           </Badge>
           <Button appearance="subtle" className="connect-shortcut" onClick={openConnectionDialog} aria-label="Trạng thái Facebook Ads MCP">
             <kbd>i</kbd><span>{mcpStatus.connected || response?.connection.meta ? "MCP đã kết nối" : "Kết nối MCP"}</span>
@@ -328,6 +328,14 @@ function Dashboard({ dark, onThemeChange }: { dark: boolean; onThemeChange: () =
         <MessageBar intent="warning" className="source-message">
           <MessageBarBody>
             <MessageBarTitle>Đang hiển thị dữ liệu minh họa</MessageBarTitle>
+            {response.message}
+          </MessageBarBody>
+        </MessageBar>
+      )}
+      {response?.source === "unavailable" && (
+        <MessageBar intent="warning" className="source-message">
+          <MessageBarBody>
+            <MessageBarTitle>Chưa thể lấy dữ liệu từ Meta Ads MCP</MessageBarTitle>
             {response.message}
           </MessageBarBody>
         </MessageBar>
@@ -462,10 +470,10 @@ function Dashboard({ dark, onThemeChange }: { dark: boolean; onThemeChange: () =
                 </>
               ) : (
                 <>
-                  <MessageBar intent={mcpStatus.dataError || (response?.source === "demo" && response.connection.meta) ? "warning" : "success"}>
+                  <MessageBar intent={mcpStatus.dataError || response?.source === "unavailable" ? "warning" : "success"}>
                     <MessageBarBody>
-                      <MessageBarTitle>{mcpStatus.dataError || (response?.source === "demo" && response.connection.meta) ? "OAuth đã kết nối, dữ liệu MCP chưa khả dụng" : "Đã kết nối thành công"}</MessageBarTitle>
-                      {mcpStatus.dataError ?? (response?.source === "demo" && response.connection.meta ? response.message : "Web đang dùng phiên OAuth của Meta Ads MCP để đọc số liệu quảng cáo.")}
+                      <MessageBarTitle>{mcpStatus.dataError || response?.source === "unavailable" ? "OAuth đã kết nối, dữ liệu MCP chưa khả dụng" : "Đã kết nối thành công"}</MessageBarTitle>
+                      {mcpStatus.dataError ?? (response?.source === "unavailable" ? response.message : "Web đang dùng phiên OAuth của Meta Ads MCP để đọc số liệu quảng cáo.")}
                     </MessageBarBody>
                   </MessageBar>
                   <div className="connection-details">

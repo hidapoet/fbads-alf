@@ -116,6 +116,13 @@ function dateInVietnam(offsetDays = 0): string {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Ho_Chi_Minh", year: "numeric", month: "2-digit", day: "2-digit" }).format(value);
 }
 
+function explainMcpError(message: string): string {
+  if (message.includes("not enabled for the Ads MCP")) {
+    return "OAuth đã kết nối, nhưng Meta chưa bật Ads MCP cho tài khoản quảng cáo này. Nhấn phím i, chọn Kết nối lại và dùng một tài khoản đã được Meta cấp Ads MCP.";
+  }
+  return message;
+}
+
 async function getMetaConfig(env: Env): Promise<MetaConfig | null> {
   const stored = await env.CONFIG.get("meta:mcp", "json");
   if (isRecord(stored) && typeof stored.sealed === "string") {
@@ -224,15 +231,16 @@ async function fetchDashboard(request: Request, env: Env): Promise<Response> {
         mcpError = "Meta Ads MCP không trả về bản ghi nào trong khoảng ngày đã chọn.";
       }
     } catch (error) {
-      mcpError = error instanceof Error ? error.message : "Không thể đọc dữ liệu từ Meta Ads MCP.";
+      mcpError = explainMcpError(error instanceof Error ? error.message : "Không thể đọc dữ liệu từ Meta Ads MCP.");
       await env.CONFIG.put("meta:mcp:last-error", mcpError.slice(0, 500), { expirationTtl: 86_400 });
       console.error(JSON.stringify({ message: "MCP dashboard query failed", error: mcpError }));
     }
   }
 
+  const mcpUnavailable = connection.meta && Boolean(mcpError);
   const payload: DashboardResponse = {
-    rows: SAMPLE_ROWS.filter((row) => granularity === "realtime" ? row.granularity === "realtime" : true),
-    source: "demo",
+    rows: mcpUnavailable ? [] : SAMPLE_ROWS.filter((row) => granularity === "realtime" ? row.granularity === "realtime" : true),
+    source: mcpUnavailable ? "unavailable" : "demo",
     message: mcpError || (connection.supabase
       ? "Supabase chưa có dữ liệu hoặc bảng fb_ads_fact chưa được tạo."
       : "Chưa cấu hình kết nối Supabase phía Worker."),
